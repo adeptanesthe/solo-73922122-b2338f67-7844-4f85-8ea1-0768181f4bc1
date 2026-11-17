@@ -1,4 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
+# TestClient 依赖（测试套件通过 FastAPI TestClient 校验 HTTP 端点）
+httpx==0.28.1
 # CPU 版 PyTorch 在 Dockerfile 中通过 pytorch 官方 CPU index 安装

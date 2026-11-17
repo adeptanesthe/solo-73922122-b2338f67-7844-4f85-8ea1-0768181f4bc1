@@ -99,7 +99,8 @@ class CausalTransformer(nn.Module):
     # ---- 前向 ----
     def _attention_layer(self, x: torch.Tensor,
                          layer: nn.TransformerEncoderLayer,
-                         layer_idx: int, use_cache: bool) -> torch.Tensor:
+                         layer_idx: int, use_cache: bool,
+                         external_cache: list | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         # norm_first 结构，缓存/无缓存两条路径完全共用这份计算
         h = layer.norm1(x)
@@ -115,11 +116,16 @@ class CausalTransformer(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         if use_cache:
-            pk, pv = self._cache[layer_idx]
+            if external_cache is None:
+                pk, pv = self._cache[layer_idx]
+            else:
+                pk, pv = external_cache[layer_idx]
             past_len = pk.shape[2]
             k = torch.cat([pk, k], dim=2)
             v = torch.cat([pv, v], dim=2)
-            self._cache[layer_idx] = (k, v)
+            if external_cache is None:
+                # 实例内缓存路径（推测解码使用）：直接写回模型缓存
+                self._cache[layer_idx] = (k, v)
             if T == 1:
                 # 单 token 增量：历史 KV 全部可见，无需遮挡
                 attn_mask = None
@@ -139,19 +145,29 @@ class CausalTransformer(nn.Module):
         h = layer.norm2(x)
         h = layer.linear2(layer.dropout(F.gelu(layer.linear1(h))))
         x = x + layer.dropout2(h)
+        if external_cache is not None:
+            # 无状态路径：把新缓存回传给调用方，绝不修改模型内部状态
+            external_cache[layer_idx] = (k, v)
         return x
 
     def forward(self, token_ids: list[int] | torch.Tensor,
-                use_cache: bool) -> torch.Tensor:
+                use_cache: bool,
+                external_cache: list | None = None,
+                count_forward: bool = True) -> torch.Tensor:
         """前向计算，返回 logits。
 
         - 传入 token id 列表（或 1D 张量）：返回形状 (seq_len, vocab_size)；
         - 传入 2D 张量：返回 (batch, seq_len, vocab_size)，仅无缓存模式支持。
         use_cache=True 时走增量路径并追加/复用 KV 缓存；
         use_cache=False 时整序列重算（基线路径），不触碰缓存。
-        每次调用 forward_count += 1。
+        每次调用 forward_count += 1（external_cache 无状态路径除外）。
+
+        external_cache 不为 None 时走**无状态**路径：KV 读写全部发生在
+        调用方传入的缓存上，模型自身的 _cache / cache_len / forward_count
+        完全不被触碰，供反例搜索与解码服务并发共存而互不污染。
         """
-        self.forward_count += 1
+        if count_forward:
+            self.forward_count += 1
         batched = isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2
         if isinstance(token_ids, list):
             x_in = torch.tensor([token_ids], dtype=torch.long)
@@ -162,19 +178,64 @@ class CausalTransformer(nn.Module):
         T = x_in.shape[1]
 
         if use_cache:
-            if self._cache is None:
-                self.init_cache()
-            positions = torch.arange(self.cache_len, self.cache_len + T)
+            if external_cache is None:
+                if self._cache is None:
+                    self.init_cache()
+                base_len = self.cache_len
+            else:
+                base_len = external_cache[0][0].shape[2]
+            positions = torch.arange(base_len, base_len + T)
         else:
             positions = torch.arange(T)
 
         h = self.tok_emb(x_in) + self.pos_emb(positions)
         for i, layer in enumerate(self.blocks):
-            h = self._attention_layer(h, layer, i, use_cache)
+            h = self._attention_layer(h, layer, i, use_cache, external_cache)
         logits = self.lm_head(self.ln_f(h))
-        if use_cache:
+        if use_cache and external_cache is None:
             self.cache_len += T
         return logits if batched else logits.squeeze(0)
+
+    # ---- 无状态单 token 前向（反例搜索专用，不触碰模型内部缓存/计数器）----
+    def new_external_cache(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """构造一份独立的空 KV 缓存（每层一对形状 (1, n_heads, 0, head_dim)）。"""
+        return [
+            (torch.empty(1, self.n_heads, 0, self.head_dim),
+             torch.empty(1, self.n_heads, 0, self.head_dim))
+            for _ in range(self.n_layers)
+        ]
+
+    def stateless_prefill(self, token_ids: list[int],
+                          external_cache: list) -> torch.Tensor:
+        """把整段前缀写入外部缓存，返回最后一个位置的 logits（不计前向计数）。"""
+        return self.forward(token_ids, use_cache=True,
+                            external_cache=external_cache, count_forward=False)[-1]
+
+    def stateless_next(self, token_id: int,
+                       external_cache: list) -> torch.Tensor:
+        """基于外部缓存做单 token 增量前向，返回该位置的 logits。
+
+        位置由外部缓存当前长度决定；缓存的追加完全在 external_cache 内完成，
+        与模型自身缓存互不影响，调用方可在不同候选间复制/分叉缓存。
+        """
+        return self.forward([token_id], use_cache=True,
+                            external_cache=external_cache,
+                            count_forward=False)[-1]
+
+    @staticmethod
+    def truncate_external_cache(
+        external_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        keep_len: int,
+    ) -> None:
+        """把外部 KV 缓存截断到前 keep_len 个位置（trie 分叉回滚用）。
+
+        仅操作调用方自己的缓存对象，绝不触碰模型内部 _cache。
+        """
+        for idx, (k, v) in enumerate(external_cache):
+            external_cache[idx] = (
+                k[:, :, :keep_len, :].contiguous(),
+                v[:, :, :keep_len, :].contiguous(),
+            )
 
 
 def _build_pair() -> tuple[CausalTransformer, CausalTransformer]:

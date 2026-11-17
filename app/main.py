@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from . import tokenizer
 from .decoding import compare
 from .model import get_models
+from .search import EditSpec, SearchError, search_counterexample
 
 app = FastAPI(title="Speculative Decoding Verifier")
 
@@ -55,6 +56,16 @@ class DecodeRequest(BaseModel):
     prompt: str = Field(default="", max_length=200)
     k: int = Field(default=3, ge=1, le=4)
     max_new: int = Field(default=32, ge=1, le=32)
+
+
+class EditSpecRequest(BaseModel):
+    position: int = Field(ge=0, le=31)
+    chars: list[str] = Field(min_length=1, max_length=3)
+
+
+class CounterexampleRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=32)
+    edits: list[EditSpecRequest] = Field(min_length=2, max_length=5)
 
 
 def _token_view(ids: list[int]) -> list[dict]:
@@ -123,6 +134,52 @@ def decode(req: DecodeRequest) -> JSONResponse:
 def presets() -> dict:
     """返回固定的两条预设（由测试套件锁定其判定类型，避免请求时全量扫描）。"""
     return {"reject": PRESET_REJECT, "all_accepted": PRESET_ALL_ACCEPTED}
+
+
+@app.post("/api/counterexample")
+def counterexample(req: CounterexampleRequest) -> JSONResponse:
+    """穷尽「最多替换两处」的候选，搜索翻转下一 token 的反例。
+
+    搜索走目标模型的无状态外部 KV 缓存，不触碰模型自身的权重、KV 与
+    前向计数；参数非法或计算/核对失败时返回 400，且不发布反例或稳定结论。
+    """
+    _, target = get_models()
+    specs = [
+        EditSpec(position=e.position, chars=tuple(e.chars)) for e in req.edits
+    ]
+    try:
+        result = search_counterexample(target, req.prompt, specs)
+    except SearchError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    payload: dict = {
+        "found": result.found,
+        "exhausted": result.exhausted,
+        "baseline": {
+            "prompt": result.baseline_prompt,
+            "prediction": {
+                "id": result.baseline_prediction,
+                "text": tokenizer.render_token(result.baseline_prediction),
+            },
+        },
+        "stats": {
+            "candidates_checked": result.candidates_checked,
+            "cache_forwards": result.cache_forwards,
+            "full_verifications": result.full_verifications,
+        },
+    }
+    if result.found:
+        payload["counterexample"] = {
+            "prompt": result.candidate_prompt,
+            "prediction": {
+                "id": result.candidate_prediction,
+                "text": tokenizer.render_token(result.candidate_prediction),
+            },
+            "edit_count": result.edit_count,
+            "changed_positions": result.changed_positions,
+            "replacement_chars": result.replacement_chars,
+        }
+    return JSONResponse(payload)
 
 
 @app.get("/")
